@@ -7,8 +7,11 @@ import argparse
 import numpy as np
 
 from torch.utils import data
+import torch.nn.functional as F
 from datasets import VOCSegmentation, Cityscapes
 from utils import ext_transforms as et
+from utils.sinkhorn_knopp import SemiCurrSinkhornKnopp
+from utils.ramps import sigmoid_rampup
 from metrics import StreamSegMetrics
 
 import torch
@@ -19,12 +22,21 @@ from PIL import Image
 import matplotlib
 import matplotlib.pyplot as plt
 
+def set_rho(current, total, rho_strategy="sigmoid", rho_base=0.1, rho_upper=0.9):
+    # if self.sk_type in ["ppot", "pot", "sla"]:
+    if rho_strategy == "sigmoid":
+        rho = sigmoid_rampup(current, total)* rho_upper + rho_base
+    elif rho_strategy == "linear":
+        rho = current / total * rho_upper + rho_base
+    else:
+        raise NotImplementedError
+    return rho
 
 def get_argparser():
     parser = argparse.ArgumentParser()
 
     # Datset Options
-    parser.add_argument("--data_root", type=str, default='./datasets/data',
+    parser.add_argument("--data_root", type=str, default='/root/autodl-tmp/',
                         help="path to Dataset")
     parser.add_argument("--dataset", type=str, default='voc',
                         choices=['voc', 'cityscapes'], help='Name of dataset')
@@ -36,7 +48,7 @@ def get_argparser():
                               not (name.startswith("__") or name.startswith('_')) and callable(
                               network.modeling.__dict__[name])
                               )
-    parser.add_argument("--model", type=str, default='deeplabv3plus_mobilenet',
+    parser.add_argument("--model", type=str, default='deeplabv3plus_resnet101',
                         choices=available_models, help='model name')
     parser.add_argument("--separable_conv", action='store_true', default=False,
                         help="apply separable conv to decoder and aspp")
@@ -46,7 +58,7 @@ def get_argparser():
     parser.add_argument("--test_only", action='store_true', default=False)
     parser.add_argument("--save_val_results", action='store_true', default=False,
                         help="save segmentation results to \"./results\"")
-    parser.add_argument("--total_itrs", type=int, default=30e3,
+    parser.add_argument("--total_itrs", type=int, default=30000,
                         help="epoch number (default: 30k)")
     parser.add_argument("--lr", type=float, default=0.01,
                         help="learning rate (default: 0.01)")
@@ -55,9 +67,9 @@ def get_argparser():
     parser.add_argument("--step_size", type=int, default=10000)
     parser.add_argument("--crop_val", action='store_true', default=False,
                         help='crop validation (default: False)')
-    parser.add_argument("--batch_size", type=int, default=16,
+    parser.add_argument("--batch_size", type=int, default=32,
                         help='batch size (default: 16)')
-    parser.add_argument("--val_batch_size", type=int, default=4,
+    parser.add_argument("--val_batch_size", type=int, default=32,
                         help='batch size for validation (default: 4)')
     parser.add_argument("--crop_size", type=int, default=513)
 
@@ -65,8 +77,8 @@ def get_argparser():
                         help="restore from checkpoint")
     parser.add_argument("--continue_training", action='store_true', default=False)
 
-    parser.add_argument("--loss_type", type=str, default='cross_entropy',
-                        choices=['cross_entropy', 'focal_loss'], help="loss type (default: False)")
+    parser.add_argument("--loss_type", type=str, default='soft_label_loss',
+                        choices=['cross_entropy', 'focal_loss', 'soft_label_loss'], help="loss type (default: False)")
     parser.add_argument("--gpu_id", type=str, default='0',
                         help="GPU ID")
     parser.add_argument("--weight_decay", type=float, default=1e-4,
@@ -75,7 +87,7 @@ def get_argparser():
                         help="random seed (default: 1)")
     parser.add_argument("--print_interval", type=int, default=10,
                         help="print interval of loss (default: 10)")
-    parser.add_argument("--val_interval", type=int, default=100,
+    parser.add_argument("--val_interval", type=int, default=10,
                         help="epoch interval for eval (default: 100)")
     parser.add_argument("--download", action='store_true', default=False,
                         help="download datasets")
@@ -165,7 +177,7 @@ def validate(opts, model, loader, device, metrics, ret_samples_ids=None):
         img_id = 0
 
     with torch.no_grad():
-        for i, (images, labels) in tqdm(enumerate(loader)):
+        for i, (images, labels, _) in tqdm(enumerate(loader)):
 
             images = images.to(device, dtype=torch.float32)
             labels = labels.to(device, dtype=torch.long)
@@ -236,10 +248,10 @@ def main():
 
     train_dst, val_dst = get_dataset(opts)
     train_loader = data.DataLoader(
-        train_dst, batch_size=opts.batch_size, shuffle=True, num_workers=2,
+        train_dst, batch_size=opts.batch_size, shuffle=True, num_workers=4,
         drop_last=True)  # drop_last=True to ignore single-image batches.
     val_loader = data.DataLoader(
-        val_dst, batch_size=opts.val_batch_size, shuffle=True, num_workers=2)
+        val_dst, batch_size=opts.val_batch_size, shuffle=False, num_workers=4)
     print("Dataset: %s, Train set: %d, Val set: %d" %
           (opts.dataset, len(train_dst), len(val_dst)))
 
@@ -269,7 +281,12 @@ def main():
     if opts.loss_type == 'focal_loss':
         criterion = utils.FocalLoss(ignore_index=255, size_average=True)
     elif opts.loss_type == 'cross_entropy':
-        criterion = nn.CrossEntropyLoss(ignore_index=255, reduction='mean')
+        criterion = torch.nn.BCEWithLogitsLoss()
+    elif opts.loss_type == 'soft_label_loss':
+        def criterion(prob_target, logits_pred):
+            log_probs = F.log_softmax(logits_pred, dim=1)
+            loss = -(prob_target * log_probs).sum(dim=1).mean()
+            return loss
 
     def save_ckpt(path):
         """ save current model
@@ -324,19 +341,44 @@ def main():
         # =====  Train  =====
         model.train()
         cur_epochs += 1
-        for (images, labels) in train_loader:
+        for (images, _, label_cls) in train_loader:
             cur_itrs += 1
+            rho = set_rho(cur_itrs, opts.total_itrs)
 
             images = images.to(device, dtype=torch.float32)
-            labels = labels.to(device, dtype=torch.long)
+            label_cls = label_cls.to(device, dtype=torch.bool)
+            B, _, H, W = images.shape
 
             optimizer.zero_grad()
             outputs = model(images)
-            loss = criterion(outputs, labels)
-            loss.backward()
+            B, K, H, W = outputs.shape
+            outputs = outputs.permute(0, 2, 3, 1).reshape(B, H * W, K)
+
+            batch_loss = 0
+
+            for i in range(B):
+                n_logit = outputs[i]
+                n_logit_selected = n_logit[:,label_cls[i]]
+                n_logit_not_selected = n_logit[:,~label_cls[i]]
+
+                all_n_logit = torch.cat([n_logit_selected, n_logit_not_selected], dim=1)
+
+                remain = torch.zeros(n_logit_not_selected.shape, device=n_logit_not_selected.device)
+
+                semiCurrSinkhornKnopp = SemiCurrSinkhornKnopp(rho=rho)
+
+                pseudo_label = semiCurrSinkhornKnopp.single_forward(n_logit_selected)
+
+                all_pseudo_label = torch.cat([pseudo_label, remain], dim=1)
+
+                single_loss = criterion(all_pseudo_label, all_n_logit)
+                batch_loss += single_loss
+            batch_loss = batch_loss / B
+
+            batch_loss.backward()
             optimizer.step()
 
-            np_loss = loss.detach().cpu().numpy()
+            np_loss = batch_loss.detach().cpu().numpy()
             interval_loss += np_loss
             if vis is not None:
                 vis.vis_scalar('Loss', cur_itrs, np_loss)

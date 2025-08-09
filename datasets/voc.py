@@ -2,6 +2,7 @@ import os
 import sys
 import tarfile
 import collections
+import torch
 import torch.utils.data as data
 import shutil
 import numpy as np
@@ -14,7 +15,7 @@ DATASET_YEAR_DICT = {
         'url': 'http://host.robots.ox.ac.uk/pascal/VOC/voc2012/VOCtrainval_11-May-2012.tar',
         'filename': 'VOCtrainval_11-May-2012.tar',
         'md5': '6cd6e144f989b92b3379bac3b3de84fd',
-        'base_dir': 'VOCdevkit/VOC2012'
+        'base_dir': 'VOC/VOC2012'
     },
     '2011': {
         'url': 'http://host.robots.ox.ac.uk/pascal/VOC/voc2011/VOCtrainval_25-May-2011.tar',
@@ -69,6 +70,16 @@ def voc_cmap(N=256, normalized=False):
     cmap = cmap/255 if normalized else cmap
     return cmap
 
+def load_image_label_list_from_npy(img_name_list):
+    cls_labels_dict = np.load('datasets/data/cls_labels_voc.npy', allow_pickle=True).item()
+
+    return [cls_labels_dict[img_name] for img_name in img_name_list]
+
+def load_img_name_list(dataset_path):
+    img_gt_name_list = open(dataset_path).read().splitlines()
+
+    return img_gt_name_list
+
 class VOCSegmentation(data.Dataset):
     """`Pascal VOC <http://host.robots.ox.ac.uk/pascal/VOC/>`_ Segmentation Dataset.
     Args:
@@ -105,18 +116,22 @@ class VOCSegmentation(data.Dataset):
         base_dir = DATASET_YEAR_DICT[year]['base_dir']
         voc_root = os.path.join(self.root, base_dir)
         image_dir = os.path.join(voc_root, 'JPEGImages')
+        self.img_name_list = load_img_name_list('datasets/data/train_aug.txt')
+
+        self.label_list = load_image_label_list_from_npy(self.img_name_list)
 
         if download:
             download_extract(self.url, self.root, self.filename, self.md5)
 
         if not os.path.isdir(voc_root):
+            print(voc_root)
             raise RuntimeError('Dataset not found or corrupted.' +
                                ' You can use download=True to download it')
         
         if is_aug and image_set=='train':
             mask_dir = os.path.join(voc_root, 'SegmentationClassAug')
             assert os.path.exists(mask_dir), "SegmentationClassAug not found, please refer to README.md and prepare it manually"
-            split_f = os.path.join( self.root, 'train_aug.txt')#'./datasets/data/train_aug.txt'
+            split_f = './datasets/data/train_aug.txt'
         else:
             mask_dir = os.path.join(voc_root, 'SegmentationClass')
             splits_dir = os.path.join(voc_root, 'ImageSets/Segmentation')
@@ -145,8 +160,10 @@ class VOCSegmentation(data.Dataset):
         target = Image.open(self.masks[index])
         if self.transform is not None:
             img, target = self.transform(img, target)
+        label_cls = np.concatenate([np.ones(1), self.label_list[index]])
 
-        return img, target
+
+        return img, target, label_cls
 
 
     def __len__(self):
