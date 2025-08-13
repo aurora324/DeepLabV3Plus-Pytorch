@@ -143,10 +143,10 @@ class VOCSegmentation(data.Dataset):
                 'or image_set="trainval" or image_set="val"')
 
         with open(os.path.join(split_f), "r") as f:
-            file_names = [x.strip() for x in f.readlines()]
+            self.file_names = [x.strip() for x in f.readlines()]
         
-        self.images = [os.path.join(image_dir, x + ".jpg") for x in file_names]
-        self.masks = [os.path.join(mask_dir, x + ".png") for x in file_names]
+        self.images = [os.path.join(image_dir, x + ".jpg") for x in self.file_names]
+        self.masks = [os.path.join(mask_dir, x + ".png") for x in self.file_names]
         assert (len(self.images) == len(self.masks))
 
     def __getitem__(self, index):
@@ -160,10 +160,12 @@ class VOCSegmentation(data.Dataset):
         target = Image.open(self.masks[index])
         if self.transform is not None:
             img, target = self.transform(img, target)
-        label_cls = np.concatenate([np.ones(1), self.label_list[index]])
+        # label_cls = np.concatenate([np.ones(1), self.label_list[index]])
+        label_cls = self.label_list[index]
+        name = self.file_names[index]
 
 
-        return img, target, label_cls
+        return {'img':img, 'target':target, 'label_cls':label_cls, 'name':name}
 
 
     def __len__(self):

@@ -33,6 +33,9 @@ class StreamSegMetrics(_StreamMetrics):
     def update(self, label_trues, label_preds):
         for lt, lp in zip(label_trues, label_preds):
             self.confusion_matrix += self._fast_hist( lt.flatten(), lp.flatten() )
+            
+    def single_update(self, label_trues, label_preds):
+        self.confusion_matrix += self._fast_hist( label_trues.flatten(), label_preds.flatten() )
     
     @staticmethod
     def to_str(results):

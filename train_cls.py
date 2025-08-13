@@ -7,8 +7,11 @@ import argparse
 import numpy as np
 
 from torch.utils import data
+import torch.nn.functional as F
 from datasets import VOCSegmentation, Cityscapes
 from utils import ext_transforms as et
+from utils.sinkhorn_knopp import SemiCurrSinkhornKnopp
+from utils.ramps import sigmoid_rampup
 from metrics import StreamSegMetrics
 
 import torch
@@ -19,6 +22,41 @@ from PIL import Image
 import matplotlib
 import matplotlib.pyplot as plt
 
+@torch.no_grad()
+def find_best_thresholds(loader, model, device, grid=201):
+    model.eval()
+    all_logits, all_labels = [], []
+    for images, _, labels in loader:
+        images = images.to(device, torch.float32)
+        logits = model(images)                  # [B,C]
+        all_logits.append(logits.cpu())
+        all_labels.append(labels.float().cpu()) # [B,C]
+    logits = torch.cat(all_logits)              # [N,C]
+    labels = torch.cat(all_labels).bool()       # [N,C]
+
+    probs = torch.sigmoid(logits)               # [N,C]
+    thrs  = torch.linspace(0, 1, grid)          # [G]
+    C = probs.shape[1]
+    best_thr = torch.zeros(C)
+    for c in range(C):
+        p = probs[:, c].unsqueeze(1) > thrs.unsqueeze(0)    # [N,G]
+        y = labels[:, c].unsqueeze(1)
+        tp = (p & y).sum(0).float()
+        fp = (p & ~y).sum(0).float()
+        fn = (~p & y).sum(0).float()
+        f1 = 2*tp / (2*tp + fp + fn + 1e-8)
+        best_thr[c] = thrs[f1.argmax()]
+    return best_thr
+
+def set_rho(current, total, rho_strategy="sigmoid", rho_base=0.1, rho_upper=0.9):
+    # if self.sk_type in ["ppot", "pot", "sla"]:
+    if rho_strategy == "sigmoid":
+        rho = sigmoid_rampup(current, total)* rho_upper + rho_base
+    elif rho_strategy == "linear":
+        rho = current / total * rho_upper + rho_base
+    else:
+        raise NotImplementedError
+    return rho
 
 def get_argparser():
     parser = argparse.ArgumentParser()
@@ -26,8 +64,8 @@ def get_argparser():
     # Datset Options
     parser.add_argument("--data_root", type=str, default='/root/autodl-tmp/',
                         help="path to Dataset")
-    parser.add_argument("--dataset", type=str, default='voc',
-                        choices=['voc', 'cityscapes'], help='Name of dataset')
+    parser.add_argument("--dataset", type=str, default='m2nist',
+                        choices=['voc', 'cityscapes', 'm2nist'], help='Name of dataset')
     parser.add_argument("--num_classes", type=int, default=None,
                         help="num classes (default: None)")
 
@@ -46,7 +84,7 @@ def get_argparser():
     parser.add_argument("--test_only", action='store_true', default=False)
     parser.add_argument("--save_val_results", action='store_true', default=False,
                         help="save segmentation results to \"./results\"")
-    parser.add_argument("--total_itrs", type=int, default=30e3,
+    parser.add_argument("--total_itrs", type=int, default=30000,
                         help="epoch number (default: 30k)")
     parser.add_argument("--lr", type=float, default=0.01,
                         help="learning rate (default: 0.01)")
@@ -55,18 +93,18 @@ def get_argparser():
     parser.add_argument("--step_size", type=int, default=10000)
     parser.add_argument("--crop_val", action='store_true', default=False,
                         help='crop validation (default: False)')
-    parser.add_argument("--batch_size", type=int, default=16,
+    parser.add_argument("--batch_size", type=int, default=32,
                         help='batch size (default: 16)')
-    parser.add_argument("--val_batch_size", type=int, default=4,
+    parser.add_argument("--val_batch_size", type=int, default=32,
                         help='batch size for validation (default: 4)')
-    parser.add_argument("--crop_size", type=int, default=513)
+    parser.add_argument("--crop_size", type=int, default=512)
 
     parser.add_argument("--ckpt", default=None, type=str,
                         help="restore from checkpoint")
     parser.add_argument("--continue_training", action='store_true', default=False)
 
-    parser.add_argument("--loss_type", type=str, default='cross_entropy',
-                        choices=['cross_entropy', 'focal_loss'], help="loss type (default: False)")
+    parser.add_argument("--loss_type", type=str, default='cls_loss',
+                        choices=['cross_entropy', 'focal_loss', 'soft_label_loss', 'cls_loss'], help="loss type (default: False)")
     parser.add_argument("--gpu_id", type=str, default='0',
                         help="GPU ID")
     parser.add_argument("--weight_decay", type=float, default=1e-4,
@@ -152,94 +190,94 @@ def get_dataset(opts):
                              split='val', transform=val_transform)
     return train_dst, val_dst
 
+@torch.no_grad()
+def validate(opts, model, loader, device, metrics=None, ret_samples_ids=None):
+    model.eval()
+    eps = 1e-8
 
-def validate(opts, model, loader, device, metrics, ret_samples_ids=None):
-    """Do validation and return specified samples"""
-    metrics.reset()
-    ret_samples = []
-    if opts.save_val_results:
-        if not os.path.exists('results'):
-            os.mkdir('results')
-        denorm = utils.Denormalize(mean=[0.485, 0.456, 0.406],
-                                   std=[0.229, 0.224, 0.225])
-        img_id = 0
+    elem_correct = 0.0
+    elem_total   = 0.0
+    subset_correct = 0.0
+    n_samples = 0
 
-    with torch.no_grad():
-        for i, pack in tqdm(enumerate(loader)):
+    per_class_correct = None
+    tp = fp = fn = 0.0
 
-            images = pack['img'].to(device, dtype=torch.float32)
-            labels = pack['target'].to(device, dtype=torch.long)
-            label_cls = pack['label_cls'].to(device, dtype=torch.long)
-            names = pack['name']
+    inter_per_class = None
+    union_per_class = None
 
-            outputs = model(images)['seg']
+    sample_iou_sum_ignore_empty = 0.0
+    sample_iou_count = 0
+    sample_iou_sum_incl_empty = 0.0
 
-            # print(images.shape, labels.shape, outputs.shape)
+    for images, _, label_cls in tqdm(loader, total=len(loader)):
+        images    = images.to(device, dtype=torch.float32)
+        label_cls = label_cls.to(device, dtype=torch.float32)  # [B,21]
+        targs = label_cls.bool()
 
-            preds = outputs.detach().max(dim=1)[1].cpu().numpy()
-            # print(preds.shape)
-            targets = labels.cpu().numpy()
+        logits = model(images)[0]               # [B,21]
+        thr = best_thr.to(logits.device)                # [C]
+        preds = (torch.sigmoid(logits) > thr)           # 按类阈值
 
-            metrics.update(targets, preds)
-            if ret_samples_ids is not None and i in ret_samples_ids:  # get vis samples
-                ret_samples.append(
-                    (images[0].detach().cpu().numpy(), targets[0], preds[0]))
+        if per_class_correct is None:
+            C = targs.size(1)
+            per_class_correct = torch.zeros(C, device=device)
+            inter_per_class   = torch.zeros(C, device=device, dtype=torch.float32)
+            union_per_class   = torch.zeros(C, device=device, dtype=torch.float32)
 
-            if opts.save_val_results:
-                for i in range(len(images)):
-                    image = images[i].detach().cpu().numpy()
-                    target = targets[i]
-                    pred = preds[i]
+        elem_correct += (preds == targs).sum().item()
+        elem_total   += preds.numel()
 
-                    H, W = pred.shape
+        subset_correct += preds.eq(targs).all(dim=1).sum().item()
+        per_class_correct += preds.eq(targs).float().sum(dim=0)
 
-                    image = (denorm(image) * 255).transpose(1, 2, 0).astype(np.uint8)
-                    target = loader.dataset.decode_target(target).astype(np.uint8)
-                    pred = loader.dataset.decode_target(pred).astype(np.uint8)
+        tp += (preds &  targs).sum().item()
+        fp += (preds & ~targs).sum().item()
+        fn += (~preds &  targs).sum().item()
 
-                    name = names[i]
-                    Image.fromarray(image).save('results/%s_image.png' % name)
-                    Image.fromarray(target).save('results/%s_target.png' % name)
-                    Image.fromarray(pred).save('results/%s_pred.png' % name)
+        inter_batch_c = (preds & targs).sum(dim=0).float()
+        union_batch_c = (preds | targs).sum(dim=0).float()
+        inter_per_class += inter_batch_c
+        union_per_class += union_batch_c
 
+        inter_s = (preds & targs).sum(dim=1).float()
+        union_s = (preds | targs).sum(dim=1).float()
+        non_zero = union_s > 0
+        if non_zero.any():
+            sample_iou_sum_ignore_empty += (inter_s[non_zero] / (union_s[non_zero] + eps)).sum().item()
+            sample_iou_count += int(non_zero.sum().item())
+        iou_s_incl_empty = torch.where(non_zero, inter_s / (union_s + eps), torch.ones_like(union_s))
+        sample_iou_sum_incl_empty += iou_s_incl_empty.sum().item()
 
-                    filename = os.path.join("/root/autodl-tmp/VOC/VOC2012/cams",
-                                    pack['name'][i] + '.npy')
-                    cam_dict = np.load(filename, allow_pickle=True).item()
-                    cams = cam_dict['attn_highres']
-                    _, h, w = cams.shape
-                    # print(cams.shape)
-                    keys = cam_dict['keys']
-                    # print(keys)
-                    # print(label_cls[i])
-                    bg_score = np.power(1 - np.max(cams, axis=0, keepdims=True), 1)
+        n_samples += targs.size(0)
 
-                    all_cams = np.zeros((21, h, w))
-                    for j in range(cams.shape[0]):
-                        all_cams[keys[j]] = cams[j]
+    elem_acc    = elem_correct / (elem_total + eps)
+    subset_acc  = subset_correct / (n_samples + eps)
+    acc_per_cls = (per_class_correct / max(n_samples, 1)).detach().cpu().tolist()
 
-                    all_cams = np.concatenate((bg_score, all_cams), axis=0)
-                    prob = all_cams
+    precision = tp / (tp + fp + eps)
+    recall    = tp / (tp + fn + eps)
+    f1_micro  = 2 * precision * recall / (precision + recall + eps)
 
-                    label = np.argmax(prob, axis=0)
-                    label = loader.dataset.decode_target(label).astype(np.uint8)
+    iou_per_class = (inter_per_class / (union_per_class + eps)).detach().cpu()
+    miou_classwise = float(iou_per_class.mean().item())
+    iou_per_class = iou_per_class.tolist()
 
-                    Image.fromarray(label).save('results/%s_cam.png' % name)
+    sample_miou_ignore_empty = float(sample_iou_sum_ignore_empty / max(sample_iou_count, 1))
+    sample_miou_incl_empty   = float(sample_iou_sum_incl_empty   / max(n_samples, 1))
 
-
-                    fig = plt.figure()
-                    plt.imshow(image)
-                    plt.axis('off')
-                    plt.imshow(pred, alpha=0.7)
-                    ax = plt.gca()
-                    ax.xaxis.set_major_locator(matplotlib.ticker.NullLocator())
-                    ax.yaxis.set_major_locator(matplotlib.ticker.NullLocator())
-                    plt.savefig('results/%s_overlay.png' % name, bbox_inches='tight', pad_inches=0)
-                    plt.close()
-                    img_id += 1
-
-        score = metrics.get_results()
-    return score, ret_samples
+    return {
+        "elem_acc": float(elem_acc),
+        "subset_acc": float(subset_acc),
+        "per_class_acc": acc_per_cls,
+        "micro_precision": float(precision),
+        "micro_recall": float(recall),
+        "micro_f1": float(f1_micro),
+        "iou_per_class": iou_per_class,
+        "miou_classwise": miou_classwise,
+        "miou_sample_ignore_empty": sample_miou_ignore_empty,
+        "miou_sample_incl_empty":   sample_miou_incl_empty,
+    }
 
 
 def main():
@@ -265,15 +303,15 @@ def main():
     random.seed(opts.random_seed)
 
     # Setup dataloader
-    if opts.dataset == 'voc' and not opts.crop_val:
-        opts.val_batch_size = 1
+    # if opts.dataset == 'voc' and not opts.crop_val:
+    #     opts.val_batch_size = 1
 
     train_dst, val_dst = get_dataset(opts)
     train_loader = data.DataLoader(
-        train_dst, batch_size=opts.batch_size, shuffle=True, num_workers=2,
+        train_dst, batch_size=opts.batch_size, shuffle=True, num_workers=0,
         drop_last=True)  # drop_last=True to ignore single-image batches.
     val_loader = data.DataLoader(
-        val_dst, batch_size=opts.val_batch_size, shuffle=True, num_workers=2)
+        val_dst, batch_size=opts.val_batch_size, shuffle=False, num_workers=0)
     print("Dataset: %s, Train set: %d, Val set: %d" %
           (opts.dataset, len(train_dst), len(val_dst)))
 
@@ -303,7 +341,29 @@ def main():
     if opts.loss_type == 'focal_loss':
         criterion = utils.FocalLoss(ignore_index=255, size_average=True)
     elif opts.loss_type == 'cross_entropy':
-        criterion = nn.CrossEntropyLoss(ignore_index=255, reduction='mean')
+        criterion = torch.nn.BCEWithLogitsLoss()
+    elif opts.loss_type == 'soft_label_loss':
+        def criterion(prob_target, logits_pred):
+            log_probs = F.log_softmax(logits_pred, dim=1)
+            loss = -(prob_target * log_probs).sum(dim=1).mean()
+            return loss
+    elif opts.loss_type == 'cls_loss':
+        def compute_pos_weight(loader, num_classes, device):
+            import torch
+            total = 0
+            pos = torch.zeros(num_classes, dtype=torch.float32)
+            with torch.no_grad():
+                for _, _, y in loader:
+                    y = y.float()
+                    pos += y.sum(0)
+                    total += y.shape[0]
+            pos = torch.clamp(pos, min=1.0)  # 防止除0
+            neg = total - pos
+            return (neg / pos).to(device)
+
+        # 创建 loss（推荐）
+        pos_weight = compute_pos_weight(train_loader, opts.num_classes, device)
+        criterion = torch.nn.BCEWithLogitsLoss(pos_weight=pos_weight)
 
     def save_ckpt(path):
         """ save current model
@@ -348,9 +408,9 @@ def main():
 
     if opts.test_only:
         model.eval()
-        val_score, ret_samples = validate(
+        val_score = validate(
             opts=opts, model=model, loader=val_loader, device=device, metrics=metrics, ret_samples_ids=vis_sample_id)
-        print(metrics.to_str(val_score))
+        print(val_score)
         return
 
     interval_loss = 0
@@ -358,19 +418,23 @@ def main():
         # =====  Train  =====
         model.train()
         cur_epochs += 1
-        for pack in train_loader:
+        for (images, _, label_cls) in train_loader:
             cur_itrs += 1
+            rho = set_rho(cur_itrs, opts.total_itrs)
 
-            images = pack['img'].to(device, dtype=torch.float32)
-            labels = pack['target'].to(device, dtype=torch.long)
+            images = images.to(device, dtype=torch.float32)
+            label_cls = label_cls.to(device, dtype=torch.float32)
+            B, _, H, W = images.shape
 
             optimizer.zero_grad()
-            outputs = model(images)['seg']
-            loss = criterion(outputs, labels)
-            loss.backward()
+            outputs = model(images)[0]
+            print(outputs.shape, label_cls.shape)
+            batch_loss = criterion(outputs, label_cls)
+
+            batch_loss.backward()
             optimizer.step()
 
-            np_loss = loss.detach().cpu().numpy()
+            np_loss = batch_loss.detach().cpu().numpy()
             interval_loss += np_loss
             if vis is not None:
                 vis.vis_scalar('Loss', cur_itrs, np_loss)
@@ -382,30 +446,18 @@ def main():
                 interval_loss = 0.0
 
             if (cur_itrs) % opts.val_interval == 0:
-                save_ckpt('checkpoints/latest_%s_%s_os%d.pth' %
+                save_ckpt('checkpoints/latest_cls_%s_%s_os%d.pth' %
                           (opts.model, opts.dataset, opts.output_stride))
                 print("validation...")
                 model.eval()
-                val_score, ret_samples = validate(
+                val_score = validate(
                     opts=opts, model=model, loader=val_loader, device=device, metrics=metrics,
                     ret_samples_ids=vis_sample_id)
-                print(metrics.to_str(val_score))
-                if val_score['Mean IoU'] > best_score:  # save best model
-                    best_score = val_score['Mean IoU']
-                    save_ckpt('checkpoints/best_%s_%s_os%d.pth' %
+                print(val_score)
+                if val_score['miou_classwise'] > best_score:  # save best model
+                    best_score = val_score['miou_classwise']
+                    save_ckpt('checkpoints/best_cls_%s_%s_os%d.pth' %
                               (opts.model, opts.dataset, opts.output_stride))
-
-                if vis is not None:  # visualize validation score and samples
-                    vis.vis_scalar("[Val] Overall Acc", cur_itrs, val_score['Overall Acc'])
-                    vis.vis_scalar("[Val] Mean IoU", cur_itrs, val_score['Mean IoU'])
-                    vis.vis_table("[Val] Class IoU", val_score['Class IoU'])
-
-                    for k, (img, target, lbl) in enumerate(ret_samples):
-                        img = (denorm(img) * 255).astype(np.uint8)
-                        target = train_dst.decode_target(target).transpose(2, 0, 1).astype(np.uint8)
-                        lbl = train_dst.decode_target(lbl).transpose(2, 0, 1).astype(np.uint8)
-                        concat_img = np.concatenate((img, target, lbl), axis=2)  # concat along width
-                        vis.vis_image('Sample %d' % k, concat_img)
                 model.train()
             scheduler.step()
 

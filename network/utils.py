@@ -9,14 +9,20 @@ class _SimpleSegmentationModel(nn.Module):
         super(_SimpleSegmentationModel, self).__init__()
         self.backbone = backbone
         self.classifier = classifier
+        self.gap = nn.AdaptiveAvgPool2d(1)           # 把 4x4 池化成 1x1
+        self.fc = nn.Linear(2048, 21)
+
         
     def forward(self, x):
         input_shape = x.shape[-2:]
         features = self.backbone(x)
         x = self.classifier(features)
         x = F.interpolate(x, size=input_shape, mode='bilinear', align_corners=False)
-        return x
 
+        outputs = features['out']
+        outputs_avg = self.gap(outputs).view(outputs.size(0), -1)      # [1024, 2048]
+        out = self.fc(outputs_avg)                         # [1024, 21]
+        return {'cls': out, 'seg': x}
 
 class IntermediateLayerGetter(nn.ModuleDict):
     """

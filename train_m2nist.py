@@ -7,8 +7,14 @@ import argparse
 import numpy as np
 
 from torch.utils import data
-from datasets import VOCSegmentation, Cityscapes
+import torch.nn.functional as F
+from torchvision.transforms import v2 as T
+from torchvision.transforms import InterpolationMode
+from torch.utils.data import Dataset, DataLoader, random_split
+from datasets import VOCSegmentation, Cityscapes, M2NISTSeg
 from utils import ext_transforms as et
+from utils.sinkhorn_knopp import SemiCurrSinkhornKnopp
+from utils.ramps import sigmoid_rampup
 from metrics import StreamSegMetrics
 
 import torch
@@ -19,6 +25,15 @@ from PIL import Image
 import matplotlib
 import matplotlib.pyplot as plt
 
+def set_rho(current, total, rho_strategy="sigmoid", rho_base=0.1, rho_upper=0.9):
+    # if self.sk_type in ["ppot", "pot", "sla"]:
+    if rho_strategy == "sigmoid":
+        rho = sigmoid_rampup(current, total)* rho_upper + rho_base
+    elif rho_strategy == "linear":
+        rho = current / total * rho_upper + rho_base
+    else:
+        raise NotImplementedError
+    return rho
 
 def get_argparser():
     parser = argparse.ArgumentParser()
@@ -26,8 +41,8 @@ def get_argparser():
     # Datset Options
     parser.add_argument("--data_root", type=str, default='/root/autodl-tmp/',
                         help="path to Dataset")
-    parser.add_argument("--dataset", type=str, default='voc',
-                        choices=['voc', 'cityscapes'], help='Name of dataset')
+    parser.add_argument("--dataset", type=str, default='m2nist',
+                        choices=['voc', 'cityscapes', 'm2nist'], help='Name of dataset')
     parser.add_argument("--num_classes", type=int, default=None,
                         help="num classes (default: None)")
 
@@ -46,7 +61,7 @@ def get_argparser():
     parser.add_argument("--test_only", action='store_true', default=False)
     parser.add_argument("--save_val_results", action='store_true', default=False,
                         help="save segmentation results to \"./results\"")
-    parser.add_argument("--total_itrs", type=int, default=30e3,
+    parser.add_argument("--total_itrs", type=int, default=30000,
                         help="epoch number (default: 30k)")
     parser.add_argument("--lr", type=float, default=0.01,
                         help="learning rate (default: 0.01)")
@@ -55,9 +70,9 @@ def get_argparser():
     parser.add_argument("--step_size", type=int, default=10000)
     parser.add_argument("--crop_val", action='store_true', default=False,
                         help='crop validation (default: False)')
-    parser.add_argument("--batch_size", type=int, default=16,
+    parser.add_argument("--batch_size", type=int, default=32,
                         help='batch size (default: 16)')
-    parser.add_argument("--val_batch_size", type=int, default=4,
+    parser.add_argument("--val_batch_size", type=int, default=32,
                         help='batch size for validation (default: 4)')
     parser.add_argument("--crop_size", type=int, default=513)
 
@@ -65,8 +80,8 @@ def get_argparser():
                         help="restore from checkpoint")
     parser.add_argument("--continue_training", action='store_true', default=False)
 
-    parser.add_argument("--loss_type", type=str, default='cross_entropy',
-                        choices=['cross_entropy', 'focal_loss'], help="loss type (default: False)")
+    parser.add_argument("--loss_type", type=str, default='soft_label_loss',
+                        choices=['cross_entropy', 'focal_loss', 'soft_label_loss'], help="loss type (default: False)")
     parser.add_argument("--gpu_id", type=str, default='0',
                         help="GPU ID")
     parser.add_argument("--weight_decay", type=float, default=1e-4,
@@ -150,6 +165,41 @@ def get_dataset(opts):
                                split='train', transform=train_transform)
         val_dst = Cityscapes(root=opts.data_root,
                              split='val', transform=val_transform)
+    if opts.dataset == 'm2nist':
+        train_transform = T.Compose([
+            T.RandomResizedCrop(size=(opts.crop_size, opts.crop_size),
+                                scale=(0.5, 2.0),
+                                interpolation=InterpolationMode.BILINEAR),
+            T.RandomHorizontalFlip(p=0.5),
+            T.ToImage(),
+            T.ToDtype(torch.float32, scale=True),
+            T.Normalize(mean=[0.485, 0.456, 0.406],
+                            std=[0.229, 0.224, 0.225]),
+        ])
+
+        if opts.crop_val:
+            val_transform = T.Compose([
+                T.Resize((opts.crop_size, opts.crop_size), interpolation=InterpolationMode.BILINEAR),
+                T.CenterCrop((opts.crop_size, opts.crop_size)),
+                T.ToImage(),
+                T.ToDtype(torch.float32, scale=True),
+                T.Normalize(mean=[0.485, 0.456, 0.406],
+                            std=[0.229, 0.224, 0.225]),
+            ])
+        else:
+            val_transform = T.Compose([
+                T.ToImage(),
+                T.ToDtype(torch.float32, scale=True),
+                T.Normalize(mean=[0.485, 0.456, 0.406],
+                            std=[0.229, 0.224, 0.225]),
+            ])
+        dataset = M2NISTSeg("data/combined.npy", "data/segmented.npy", transform=train_transform)
+        N = len(dataset)
+        n_train = int(0.9 * N)
+        n_val = N - n_train
+        train_dst, val_dst = random_split(dataset, [n_train, n_val], generator=torch.Generator().manual_seed(42))
+
+
     return train_dst, val_dst
 
 
@@ -165,19 +215,13 @@ def validate(opts, model, loader, device, metrics, ret_samples_ids=None):
         img_id = 0
 
     with torch.no_grad():
-        for i, pack in tqdm(enumerate(loader)):
+        for i, (images, labels, _) in tqdm(enumerate(loader)):
 
-            images = pack['img'].to(device, dtype=torch.float32)
-            labels = pack['target'].to(device, dtype=torch.long)
-            label_cls = pack['label_cls'].to(device, dtype=torch.long)
-            names = pack['name']
+            images = images.to(device, dtype=torch.float32)
+            labels = labels.to(device, dtype=torch.long)
 
-            outputs = model(images)['seg']
-
-            # print(images.shape, labels.shape, outputs.shape)
-
+            outputs = model(images)
             preds = outputs.detach().max(dim=1)[1].cpu().numpy()
-            # print(preds.shape)
             targets = labels.cpu().numpy()
 
             metrics.update(targets, preds)
@@ -191,41 +235,13 @@ def validate(opts, model, loader, device, metrics, ret_samples_ids=None):
                     target = targets[i]
                     pred = preds[i]
 
-                    H, W = pred.shape
-
                     image = (denorm(image) * 255).transpose(1, 2, 0).astype(np.uint8)
-                    target = loader.dataset.decode_target(target).astype(np.uint8)
-                    pred = loader.dataset.decode_target(pred).astype(np.uint8)
+                    target = M2NISTSeg.decode_target(target).astype(np.uint8)
+                    pred = M2NISTSeg.decode_target(pred).astype(np.uint8)
 
-                    name = names[i]
-                    Image.fromarray(image).save('results/%s_image.png' % name)
-                    Image.fromarray(target).save('results/%s_target.png' % name)
-                    Image.fromarray(pred).save('results/%s_pred.png' % name)
-
-
-                    filename = os.path.join("/root/autodl-tmp/VOC/VOC2012/cams",
-                                    pack['name'][i] + '.npy')
-                    cam_dict = np.load(filename, allow_pickle=True).item()
-                    cams = cam_dict['attn_highres']
-                    _, h, w = cams.shape
-                    # print(cams.shape)
-                    keys = cam_dict['keys']
-                    # print(keys)
-                    # print(label_cls[i])
-                    bg_score = np.power(1 - np.max(cams, axis=0, keepdims=True), 1)
-
-                    all_cams = np.zeros((21, h, w))
-                    for j in range(cams.shape[0]):
-                        all_cams[keys[j]] = cams[j]
-
-                    all_cams = np.concatenate((bg_score, all_cams), axis=0)
-                    prob = all_cams
-
-                    label = np.argmax(prob, axis=0)
-                    label = loader.dataset.decode_target(label).astype(np.uint8)
-
-                    Image.fromarray(label).save('results/%s_cam.png' % name)
-
+                    Image.fromarray(image).save('results/%d_image.png' % img_id)
+                    Image.fromarray(target).save('results/%d_target.png' % img_id)
+                    Image.fromarray(pred).save('results/%d_pred.png' % img_id)
 
                     fig = plt.figure()
                     plt.imshow(image)
@@ -234,7 +250,7 @@ def validate(opts, model, loader, device, metrics, ret_samples_ids=None):
                     ax = plt.gca()
                     ax.xaxis.set_major_locator(matplotlib.ticker.NullLocator())
                     ax.yaxis.set_major_locator(matplotlib.ticker.NullLocator())
-                    plt.savefig('results/%s_overlay.png' % name, bbox_inches='tight', pad_inches=0)
+                    plt.savefig('results/%d_overlay.png' % img_id, bbox_inches='tight', pad_inches=0)
                     plt.close()
                     img_id += 1
 
@@ -248,6 +264,8 @@ def main():
         opts.num_classes = 21
     elif opts.dataset.lower() == 'cityscapes':
         opts.num_classes = 19
+    elif opts.dataset.lower() == 'm2nist':
+        opts.num_classes = 11
 
     # Setup visualization
     vis = Visualizer(port=opts.vis_port,
@@ -270,10 +288,10 @@ def main():
 
     train_dst, val_dst = get_dataset(opts)
     train_loader = data.DataLoader(
-        train_dst, batch_size=opts.batch_size, shuffle=True, num_workers=2,
+        train_dst, batch_size=opts.batch_size, shuffle=True, num_workers=4,
         drop_last=True)  # drop_last=True to ignore single-image batches.
     val_loader = data.DataLoader(
-        val_dst, batch_size=opts.val_batch_size, shuffle=True, num_workers=2)
+        val_dst, batch_size=opts.val_batch_size, shuffle=False, num_workers=4)
     print("Dataset: %s, Train set: %d, Val set: %d" %
           (opts.dataset, len(train_dst), len(val_dst)))
 
@@ -303,7 +321,12 @@ def main():
     if opts.loss_type == 'focal_loss':
         criterion = utils.FocalLoss(ignore_index=255, size_average=True)
     elif opts.loss_type == 'cross_entropy':
-        criterion = nn.CrossEntropyLoss(ignore_index=255, reduction='mean')
+        criterion = torch.nn.BCEWithLogitsLoss()
+    elif opts.loss_type == 'soft_label_loss':
+        def criterion(prob_target, logits_pred):
+            log_probs = F.log_softmax(logits_pred, dim=1)
+            loss = -(prob_target * log_probs).sum(dim=1).mean()
+            return loss
 
     def save_ckpt(path):
         """ save current model
@@ -358,19 +381,46 @@ def main():
         # =====  Train  =====
         model.train()
         cur_epochs += 1
-        for pack in train_loader:
+        for (images, label, label_cls) in train_loader:
             cur_itrs += 1
+            rho = set_rho(cur_itrs, opts.total_itrs)
 
-            images = pack['img'].to(device, dtype=torch.float32)
-            labels = pack['target'].to(device, dtype=torch.long)
+            images = images.to(device, dtype=torch.float32)
+            label_cls = label_cls.to(device, dtype=torch.bool)
+            B, _, H, W = images.shape
 
             optimizer.zero_grad()
-            outputs = model(images)['seg']
-            loss = criterion(outputs, labels)
-            loss.backward()
+            outputs = model(images)
+            B, K, H, W = outputs.shape
+            # print(outputs.shape)
+            outputs = outputs.permute(0, 2, 3, 1).reshape(B, H * W, K)
+            # print(images.shape, label.shape, label_cls.shape, outputs.shape)
+
+            batch_loss = 0
+
+            for i in range(B):
+                n_logit = outputs[i]
+                n_logit_selected = n_logit[:,label_cls[i]]
+                n_logit_not_selected = n_logit[:,~label_cls[i]]
+
+                all_n_logit = torch.cat([n_logit_selected, n_logit_not_selected], dim=1)
+
+                remain = torch.zeros(n_logit_not_selected.shape, device=n_logit_not_selected.device)
+
+                semiCurrSinkhornKnopp = SemiCurrSinkhornKnopp(rho=rho)
+
+                pseudo_label = semiCurrSinkhornKnopp.single_forward(n_logit_selected)
+
+                all_pseudo_label = torch.cat([pseudo_label, remain], dim=1)
+
+                single_loss = criterion(all_pseudo_label, all_n_logit)
+                batch_loss += single_loss
+            batch_loss = batch_loss / B
+
+            batch_loss.backward()
             optimizer.step()
 
-            np_loss = loss.detach().cpu().numpy()
+            np_loss = batch_loss.detach().cpu().numpy()
             interval_loss += np_loss
             if vis is not None:
                 vis.vis_scalar('Loss', cur_itrs, np_loss)

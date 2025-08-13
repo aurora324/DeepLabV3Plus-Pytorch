@@ -9,3 +9,7 @@ checkpoints_bak
 cityscapes
 test_results
 /**.log
+/predict
+/data
+/vis
+/voc

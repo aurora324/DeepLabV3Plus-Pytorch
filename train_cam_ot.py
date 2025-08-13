@@ -5,10 +5,16 @@ import os
 import random
 import argparse
 import numpy as np
+import cv2
 
 from torch.utils import data
+import torch.nn.functional as F
 from datasets import VOCSegmentation, Cityscapes
 from utils import ext_transforms as et
+from utils.ramps import sigmoid_rampup
+from utils.sinkhorn_knopp import SemiCurrSinkhornKnopp
+from utils import imutils
+
 from metrics import StreamSegMetrics
 
 import torch
@@ -19,6 +25,15 @@ from PIL import Image
 import matplotlib
 import matplotlib.pyplot as plt
 
+def set_rho(current, total, rho_strategy="sigmoid", rho_base=0.1, rho_upper=0.9):
+    # if self.sk_type in ["ppot", "pot", "sla"]:
+    if rho_strategy == "sigmoid":
+        rho = sigmoid_rampup(current, total)* rho_upper + rho_base
+    elif rho_strategy == "linear":
+        rho = current / total * rho_upper + rho_base
+    else:
+        raise NotImplementedError
+    return rho
 
 def get_argparser():
     parser = argparse.ArgumentParser()
@@ -46,7 +61,7 @@ def get_argparser():
     parser.add_argument("--test_only", action='store_true', default=False)
     parser.add_argument("--save_val_results", action='store_true', default=False,
                         help="save segmentation results to \"./results\"")
-    parser.add_argument("--total_itrs", type=int, default=30e3,
+    parser.add_argument("--total_itrs", type=int, default=100,
                         help="epoch number (default: 30k)")
     parser.add_argument("--lr", type=float, default=0.01,
                         help="learning rate (default: 0.01)")
@@ -81,7 +96,7 @@ def get_argparser():
                         help="download datasets")
 
     # PASCAL VOC Options
-    parser.add_argument("--year", type=str, default='2012',
+    parser.add_argument("--year", type=str, default='2012_aug',
                         choices=['2012_aug', '2012', '2011', '2009', '2008', '2007'], help='year of VOC')
 
     # Visdom options
@@ -173,6 +188,7 @@ def validate(opts, model, loader, device, metrics, ret_samples_ids=None):
             names = pack['name']
 
             outputs = model(images)['seg']
+            B, K, H, W = outputs.shape
 
             # print(images.shape, labels.shape, outputs.shape)
 
@@ -180,7 +196,7 @@ def validate(opts, model, loader, device, metrics, ret_samples_ids=None):
             # print(preds.shape)
             targets = labels.cpu().numpy()
 
-            metrics.update(targets, preds)
+            
             if ret_samples_ids is not None and i in ret_samples_ids:  # get vis samples
                 ret_samples.append(
                     (images[0].detach().cpu().numpy(), targets[0], preds[0]))
@@ -189,11 +205,13 @@ def validate(opts, model, loader, device, metrics, ret_samples_ids=None):
                 for i in range(len(images)):
                     image = images[i].detach().cpu().numpy()
                     target = targets[i]
-                    pred = preds[i]
-
-                    H, W = pred.shape
+                    pred = preds[i]                    
 
                     image = (denorm(image) * 255).transpose(1, 2, 0).astype(np.uint8)
+
+                    pred = imutils.crf_inference_label(image, pred, n_labels=K)
+                    preds[i] = pred
+
                     target = loader.dataset.decode_target(target).astype(np.uint8)
                     pred = loader.dataset.decode_target(pred).astype(np.uint8)
 
@@ -214,7 +232,7 @@ def validate(opts, model, loader, device, metrics, ret_samples_ids=None):
                     # print(label_cls[i])
                     bg_score = np.power(1 - np.max(cams, axis=0, keepdims=True), 1)
 
-                    all_cams = np.zeros((21, h, w))
+                    all_cams = np.zeros((K - 1, h, w))
                     for j in range(cams.shape[0]):
                         all_cams[keys[j]] = cams[j]
 
@@ -227,6 +245,7 @@ def validate(opts, model, loader, device, metrics, ret_samples_ids=None):
                     Image.fromarray(label).save('results/%s_cam.png' % name)
 
 
+
                     fig = plt.figure()
                     plt.imshow(image)
                     plt.axis('off')
@@ -237,7 +256,8 @@ def validate(opts, model, loader, device, metrics, ret_samples_ids=None):
                     plt.savefig('results/%s_overlay.png' % name, bbox_inches='tight', pad_inches=0)
                     plt.close()
                     img_id += 1
-
+                    
+                    metrics.single_update(targets[i], preds[i])
         score = metrics.get_results()
     return score, ret_samples
 
@@ -273,7 +293,7 @@ def main():
         train_dst, batch_size=opts.batch_size, shuffle=True, num_workers=2,
         drop_last=True)  # drop_last=True to ignore single-image batches.
     val_loader = data.DataLoader(
-        val_dst, batch_size=opts.val_batch_size, shuffle=True, num_workers=2)
+        val_dst, batch_size=opts.val_batch_size, shuffle=False, num_workers=2)
     print("Dataset: %s, Train set: %d, Val set: %d" %
           (opts.dataset, len(train_dst), len(val_dst)))
 
@@ -303,7 +323,7 @@ def main():
     if opts.loss_type == 'focal_loss':
         criterion = utils.FocalLoss(ignore_index=255, size_average=True)
     elif opts.loss_type == 'cross_entropy':
-        criterion = nn.CrossEntropyLoss(ignore_index=255, reduction='mean')
+        criterion = torch.nn.CrossEntropyLoss(ignore_index=255)
 
     def save_ckpt(path):
         """ save current model
@@ -360,17 +380,57 @@ def main():
         cur_epochs += 1
         for pack in train_loader:
             cur_itrs += 1
+            rho = set_rho(cur_itrs, opts.total_itrs)
 
-            images = pack['img'].to(device, dtype=torch.float32)
-            labels = pack['target'].to(device, dtype=torch.long)
+            images = pack['img'].to(device=device, dtype=torch.float32)
+            label_cls = pack['label_cls'].to(device=device, dtype=torch.float32)
+
+            B, _, H, W = images.shape
+            B, K = label_cls.shape
+
+            label_cls = torch.cat([torch.ones([B, 1], device=device), label_cls], dim=1).bool()
+
 
             optimizer.zero_grad()
             outputs = model(images)['seg']
-            loss = criterion(outputs, labels)
-            loss.backward()
+            B, K, H, W = outputs.shape
+            outputs = outputs.permute(0, 2, 3, 1).reshape(B, H * W, K)
+
+            batch_loss = 0
+
+            for i in range(B):
+                n_logit = outputs[i]
+                n_logit_selected = n_logit[:,label_cls[i]]
+                n_logit_not_selected = n_logit[:,~label_cls[i]]
+
+                all_n_logit = torch.cat([n_logit_selected, n_logit_not_selected], dim=1)
+
+                remain = torch.zeros(n_logit_not_selected.shape, device=n_logit_not_selected.device)
+
+                semiCurrSinkhornKnopp = SemiCurrSinkhornKnopp(rho=rho)
+
+                pseudo_label = semiCurrSinkhornKnopp.single_forward(n_logit_selected)
+
+                all_pseudo_label = torch.cat([pseudo_label, remain], dim=1)
+
+                import torch.nn.functional as F
+
+                # logits: all_n_logit [B,21,512,512]
+                # soft targets: all_pseudo_label [B,21,512,512]，每像素沿 C 和为 1
+                q = all_pseudo_label.clamp_min(1e-8)
+                q = q / q.sum(dim=1, keepdim=True).clamp_min(1e-8)  # 若你已确保归一，这行可删
+                log_p = F.log_softmax(all_n_logit, dim=1)
+
+                loss_map = -(q * log_p).sum(dim=1)   # [B,512,512]  注意这个负号！
+                single_loss = loss_map.mean()
+
+                batch_loss += single_loss
+            batch_loss = batch_loss / B
+
+            batch_loss.backward()
             optimizer.step()
 
-            np_loss = loss.detach().cpu().numpy()
+            np_loss = batch_loss.detach().cpu().numpy()
             interval_loss += np_loss
             if vis is not None:
                 vis.vis_scalar('Loss', cur_itrs, np_loss)
@@ -411,6 +471,7 @@ def main():
 
             if cur_itrs >= opts.total_itrs:
                 return
+
 
 
 if __name__ == '__main__':
